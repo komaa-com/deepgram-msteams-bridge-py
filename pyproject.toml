@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deepgram-msteams-bridge"
+version = "0.1.0"
+description = "Put a Deepgram Voice Agent on Microsoft Teams calls. Terminates the StandIn media bridge wire protocol on one side and the Deepgram Voice Agent WebSocket on the other. No transcoding: PCM 16k verbatim both ways, barge-in, extensible client-side tools, vision on demand, call governors."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Alaaeldin Elhenawy", email = "alaamh@outlook.com" }]
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.9,<4"]
+keywords = [
+  "deepgram",
+  "voice-agent",
+  "microsoft-teams",
+  "voice",
+  "agent",
+  "websocket",
+  "bridge",
+  "telephony",
+  "speech-to-speech",
+  "conversational-ai",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications :: Telephony",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Framework :: AsyncIO",
+]
+
+[project.urls]
+Homepage = "https://github.com/komaa-com/deepgram-msteams-bridge-py"
+Documentation = "https://github.com/komaa-com/deepgram-msteams-bridge-py#readme"
+"StandIn docs" = "https://docs.komaa.com/deepgram/installation"
+Repository = "https://github.com/komaa-com/deepgram-msteams-bridge-py"
+Issues = "https://github.com/komaa-com/deepgram-msteams-bridge-py/issues"
+
+[project.scripts]
+deepgram-msteams-bridge = "deepgram_msteams_bridge.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "README.md", "LICENSE", ".env.example"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deepgram_msteams_bridge"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
