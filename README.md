@@ -44,9 +44,9 @@ Voice Agent WebSocket (`wss://agent.deepgram.com/v1/agent/converse`) on the othe
 [StandIn](https://standin.komaa.com) is the hosted media bridge that joins the Teams call and dials
 this bridge - you run no Teams media stack yourself.
 
-**Documentation**: [github.com/komaa-com/deepgram-msteams-bridge-py](https://github.com/komaa-com/deepgram-msteams-bridge-py)
-and the Node sibling's [docs site](https://komaa-com.github.io/deepgram-msteams-bridge/) (same wire
-contract and environment variables). Teams/StandIn setup lives at
+**Documentation**: [komaa-com.github.io/deepgram-msteams-bridge-py](https://komaa-com.github.io/deepgram-msteams-bridge-py/) -
+getting started, the runnable example, configuration, library API, wire protocol, and
+troubleshooting. Teams/StandIn setup lives at
 [docs.komaa.com](https://docs.komaa.com/deepgram/installation).
 
 ## Install
