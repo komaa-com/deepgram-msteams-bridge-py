@@ -13,6 +13,7 @@ import signal
 import sys
 
 from .config import load_config
+from .log import refresh_log_level
 from .server import start_server
 
 
@@ -62,6 +63,7 @@ async def _run() -> None:
 
 def main() -> None:
     load_dotenv()
+    refresh_log_level()  # a LOG_LEVEL from .env must take effect
     try:
         asyncio.run(_run())
     except ValueError as err:  # config errors (missing/invalid env vars)

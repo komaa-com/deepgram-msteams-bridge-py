@@ -216,7 +216,7 @@ async def test_callid_mismatch_closes() -> None:
     assert h.session.closed
 
 
-async def test_function_calls_express_show_image_unknown_and_server_side() -> None:
+async def test_function_calls_express_show_image_unknown_and_server_side(monkeypatch: Any) -> None:
     h = Harness()
     await h.start()
 
@@ -235,19 +235,27 @@ async def test_function_calls_express_show_image_unknown_and_server_side() -> No
     await settle()
     assert "at most" in h.tool_results()["t1c"][1]
 
-    # inline show_image -> display.image
-    h.function_call("t2", "show_image", json.dumps({"dataBase64": "aW1n", "mime": "image/png", "caption": "chart"}))
+    # show_image url path (the only advertised contract) -> display.image
+    async def fake_fetch(url: str, max_bytes: int, timeout_ms: int) -> tuple[bytes, str]:
+        assert url == "https://example.com/pic.png"
+        return b"img-bytes", "image/png"
+
+    monkeypatch.setattr(session_mod, "fetch_public_image", fake_fetch)
+    h.function_call("t2", "show_image", json.dumps({"url": "https://example.com/pic.png", "caption": "chart"}))
     await settle()
     img = h.worker.of_type("display.image")[0]
     assert img["mime"] == "image/png" and img["caption"] == "chart"
+    assert img["dataBase64"] == base64.b64encode(b"img-bytes").decode()
     assert "shown" in h.tool_results()["t2"][1]
 
-    # oversize inline image -> error result
-    h.function_call("t3", "show_image", json.dumps({"dataBase64": "A" * 7_100_000, "mime": "image/png"}))
+    # inline dataBase64 is NOT part of the schema the model sees - refused, so
+    # the advertised contract and the handler cannot drift apart again
+    h.function_call("t3", "show_image", json.dumps({"dataBase64": "aW1n", "mime": "image/png"}))
     await settle()
-    assert "too large" in h.tool_results()["t3"][1]
+    assert "url" in h.tool_results()["t3"][1]
 
     # SSRF: a metadata URL is refused (validation raises before any fetch)
+    monkeypatch.undo()
     h.function_call("t4", "show_image", json.dumps({"url": "http://169.254.169.254/latest/meta-data/"}))
     await settle()
     assert "failed" in h.tool_results()["t4"][1]
@@ -488,3 +496,77 @@ async def test_hot_path_backpressure_drops_only_disposable_audio() -> None:
     assert h.worker.of_type("audio.frame") == []
     h.worker_says({"type": "ping", "ts": 1})  # control frames always pass
     assert h.worker.of_type("pong")
+
+
+async def test_session_start_failure_tears_the_call_down() -> None:
+    """A crash while wiring the agent session must end the call immediately,
+    not leave it half-alive (no agent, no governor) until a watchdog."""
+
+    class BadAgent(FakeAgentPort):
+        def send_settings(self, settings: dict) -> None:
+            raise RuntimeError("settings exploded")
+
+    worker = FakeWorkerPort()
+
+    async def connect(cfg: Any, log: Any, handlers: Any) -> BadAgent:
+        return BadAgent()
+
+    session = CallSession(make_config(), worker, "call-1", connect_dg=connect, vision=None)
+    session.handle_worker_message(json.dumps({"type": "session.start", "callId": "call-1", "caller": {}}))
+    await settle()
+    assert session.closed
+    ends = worker.of_type("session.end")
+    assert ends and ends[0]["reason"] == "session-start-failed"
+
+
+async def test_agent_error_and_injection_refused_are_counted() -> None:
+    from deepgram_msteams_bridge.metrics import render_metrics, reset_metrics
+
+    reset_metrics()
+    h = Harness()
+    await h.start()
+    h.agent_event({"type": "Error", "code": "X", "description": "boom"})
+    h.agent_event({"type": "InjectionRefused", "message": "mid-utterance"})
+    text = render_metrics()
+    assert "bridge_agent_errors_total 1" in text
+    assert "bridge_injections_refused_total 1" in text
+    assert not h.session.closed  # counted, not fatal
+
+
+async def test_shutdown_defers_to_goodbye_in_progress() -> None:
+    """SIGTERM drain must not cut off a goodbye the caller is still hearing;
+    the goodbye's own hard-bounded backstop ends the call."""
+    h = Harness()
+    await h.start()
+    h.worker_says({"type": "assistant.say", "text": "goodbye now"})
+    await settle()
+    assert h.session._goodbye_in_progress
+    h.session.shutdown("bridge-shutdown")
+    assert not h.session.closed  # left to finish
+    h.session.end_call("test-cleanup")
+
+
+async def test_drain_waits_for_goodbye_backstop(monkeypatch: Any) -> None:
+    import time as _time
+
+    import deepgram_msteams_bridge.server as server_mod
+
+    monkeypatch.setattr(server_mod, "SHUTDOWN_GRACE_S", 0.05)
+    monkeypatch.setattr(session_mod, "GOODBYE_HARD_CAP_MS", 150)
+    h = Harness(cfg=make_config(goodbye_grace_ms=50))
+    await h.start()
+    server = server_mod.BridgeServer(h.cfg, None, None)
+    server.sessions["call-1"] = h.session
+    h.session._on_closed = lambda: server.sessions.pop("call-1", None)
+
+    h.worker_says({"type": "assistant.say", "text": "goodbye now"})
+    await settle()
+    assert h.session._goodbye_in_progress and not h.session.closed
+
+    t0 = _time.monotonic()
+    await server.drain("SIGTERM")
+    assert _time.monotonic() - t0 < 2
+    assert h.session.closed and not server.sessions
+    # the goodbye backstop ended the call, not a hard drain cut
+    ends = h.worker.of_type("session.end")
+    assert ends and ends[0]["reason"] == "goodbye-timeout"

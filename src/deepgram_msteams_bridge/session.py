@@ -51,6 +51,10 @@ MAX_OUTBOUND_BUFFER_BYTES = 1 * 1024 * 1024
 # Live context notes kept in the prompt (participants/dtmf/speaker), most recent last.
 MAX_CONTEXT_NOTES = 8
 
+# Bounded wait for the end_call tool response to reach Deepgram before the
+# socket closes underneath it (the send is otherwise fire-and-forget).
+END_CALL_REPLY_TIMEOUT_S = 1.0
+
 # Extra headroom on top of the goodbye grace before the governor force-ends the
 # call, so a hung TTS synth can never wedge a time-limited call open.
 GOODBYE_HARD_CAP_MS = 8_000
@@ -65,10 +69,6 @@ SPEAKER_UPDATE_MIN_INTERVAL_MS = 5_000
 
 # Dead-peer window: worker heartbeats every 30 s -> 3 missed pings ends the call.
 DEFAULT_WORKER_IDLE_TIMEOUT_MS = 90_000
-
-# Inline show_image dataBase64 cap - same 5 MB bound as the URL path,
-# expressed in base64 characters (4 chars per 3 bytes).
-MAX_INLINE_IMAGE_B64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
 
 # Bounds on agent-supplied strings relayed to the worker as control frames,
 # so a misbehaving model cannot emit multi-MB frames.
@@ -169,6 +169,11 @@ class CallSession:
         self._governor_handle: asyncio.TimerHandle | None = None
         self._goodbye_handle: asyncio.TimerHandle | None = None
 
+        # Strong refs to fire-and-forget tasks (tool dispatch, session.start,
+        # goodbyes): CPython's asyncio may garbage-collect an un-referenced
+        # task before it runs to completion.
+        self._bg_tasks: set[asyncio.Task] = set()
+
         # Dead-peer detection: a half-open TCP socket (NAT timeout, peer crash)
         # delivers nothing and never closes - the session would stay "live" for
         # hours, holding the billed Voice Agent session open AND blocking every
@@ -177,6 +182,13 @@ class CallSession:
         idle_ms = cfg.worker_idle_timeout_ms if cfg.worker_idle_timeout_ms > 0 else DEFAULT_WORKER_IDLE_TIMEOUT_MS
         self._idle_ms = idle_ms
         self._idle_task = asyncio.create_task(self._idle_watchdog(max(0.02, min(idle_ms / 6000, 15.0))))
+
+    def _spawn(self, coro: Any) -> asyncio.Task:
+        """ensure_future with a strong reference held until completion."""
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # ---- lifecycle wiring (called by the server's read loop) ----
 
@@ -228,7 +240,7 @@ class CallSession:
             # message and the scheduled coroutine's first step, and they must be
             # buffered (not dropped) for the flush after SettingsApplied.
             self.session_started = True
-            asyncio.ensure_future(self._on_session_start_safe(msg))
+            self._spawn(self._on_session_start_safe(msg))
         elif mtype == "audio.frame":
             # hot path: caller audio -> agent, verbatim (base64 -> binary
             # frame). Until the server acks Settings (SettingsApplied), buffer
@@ -271,7 +283,7 @@ class CallSession:
                 self.log.debug(f'ignoring video.frame with unknown source "{source}"')
         elif mtype == "assistant.say":
             # worker-side governor: speak, the worker tears down afterwards
-            asyncio.ensure_future(self._perform_goodbye_safe(str(msg.get("text") or "")))
+            self._spawn(self._perform_goodbye_safe(str(msg.get("text") or "")))
         elif mtype == "session.end":
             self.log.info(f"session.end from worker: {msg.get('reason')}")
             self._teardown("worker-session-end")
@@ -282,7 +294,10 @@ class CallSession:
         try:
             await self._on_session_start(msg)
         except Exception as err:
+            # End the call NOW: without this the call would sit half-alive (no
+            # agent socket, no governor) until a watchdog notices minutes later.
             self.log.error(f"session.start handling failed: {err}")
+            self.end_call("session-start-failed")
 
     async def _on_session_start(self, msg: dict[str, Any]) -> None:
         msg_call_id = msg.get("callId")
@@ -357,9 +372,7 @@ class CallSession:
         # Bridge-side governor: Deepgram doesn't know about your billing.
         if self.cfg.max_call_minutes > 0:
             limit_s = self.cfg.max_call_minutes * 60
-            self._governor_handle = loop.call_later(
-                limit_s, lambda: asyncio.ensure_future(self._on_governor_limit_safe())
-            )
+            self._governor_handle = loop.call_later(limit_s, lambda: self._spawn(self._on_governor_limit_safe()))
             self.log.info(f"governor armed: max {self.cfg.max_call_minutes:g} min")
 
     async def _on_governor_limit_safe(self) -> None:
@@ -436,7 +449,7 @@ class CallSession:
         if self._dropping_agent_audio:
             self.log.debug("dropping ghost agent audio (after barge-in / goodbye flush)")
             return
-        self._emit_audio_to_worker(base64.b64encode(pcm).decode("ascii"))
+        self._emit_audio_to_worker(base64.b64encode(pcm).decode("ascii"), pcm_bytes=len(pcm))
 
     def _on_dg_message(self, msg: dict[str, Any]) -> None:
         mtype = msg.get("type")
@@ -487,8 +500,10 @@ class CallSession:
         elif mtype == "InjectionRefused":
             # The goodbye fallback can be refused while the agent is
             # mid-utterance; the goodbye grace/backstop still ends the call.
+            metric_inc("bridge_injections_refused_total")
             self.log.warn(f"InjectionRefused: {msg.get('message') or 'no detail'}")
         elif mtype == "Error":
+            metric_inc("bridge_agent_errors_total")
             self.log.warn(
                 f"Deepgram error event: {msg.get('code') or 'unknown'}: {msg.get('description') or 'no description'}"
             )
@@ -519,9 +534,8 @@ class CallSession:
             params = raw_args
 
         if name == "end_call":
-            self._reply_tool(call_id, name, "call ended")
             self.log.info("agent requested end_call")
-            self.end_call("agent-ended-call")
+            self._spawn(self._finish_end_call(call_id, name))
         elif name == "express":
             emotion = params.get("emotion") if isinstance(params.get("emotion"), str) else ""
             emotion = (emotion or "").strip()
@@ -534,18 +548,31 @@ class CallSession:
             self._send_to_worker({"type": "expression", "emotion": emotion})
             self._reply_tool(call_id, name, f"expressing {emotion}")
         elif name == "show_image":
-            asyncio.ensure_future(self._on_show_image(call_id, name, params))
+            self._spawn(self._on_show_image(call_id, name, params))
         elif name == "look":
-            asyncio.ensure_future(self._on_look(call_id, name, params))
+            self._spawn(self._on_look(call_id, name, params))
         elif name in self._custom_tools:
             # Embedder-registered custom tools (the extensibility surface): run
             # the handler, return its string as the function output. A raise
             # becomes an error output so the model can recover; it must never
             # escape into the read loop.
-            asyncio.ensure_future(self._run_custom_tool(self._custom_tools[name], call_id, params))
+            self._spawn(self._run_custom_tool(self._custom_tools[name], call_id, params))
         else:
             self._reply_tool(call_id, name, f'tool "{name}" is not implemented by this bridge')
             self.log.warn(f"unmapped function tool: {name}")
+
+    async def _finish_end_call(self, call_id: str, name: str) -> None:
+        """Answer the end_call tool, WAIT (bounded) for the send to actually
+        reach the socket, then tear down - closing immediately would race the
+        fire-and-forget send and could eat the agent's tool response."""
+        if self.dg is not None:
+            try:
+                pending = self.dg.send_function_call_response(call_id, name, "call ended")
+                if inspect.isawaitable(pending):
+                    await asyncio.wait_for(pending, timeout=END_CALL_REPLY_TIMEOUT_S)
+            except Exception:
+                pass  # the call ends regardless
+        self.end_call("agent-ended-call")
 
     async def _run_custom_tool(self, tool: CustomTool, call_id: str, params: dict[str, Any]) -> None:
         ctx = CustomToolContext(
@@ -569,26 +596,23 @@ class CallSession:
             self.dg.send_function_call_response(call_id, name, content)
 
     async def _on_show_image(self, call_id: str, name: str, params: dict[str, Any]) -> None:
-        """show_image -> display.image on the bot's video tile. Accepts either
-        inline base64 ({dataBase64, mime}) or a URL the bridge fetches server-side."""
+        """show_image -> display.image on the bot's video tile. URL-only, exactly
+        what the advertised function schema says: the only caller is the think
+        LLM, which cannot produce real image bytes inline, so an inline-base64
+        path would be dead code the schema could never honestly advertise."""
         try:
-            data_base64 = params.get("dataBase64") if isinstance(params.get("dataBase64"), str) else None
-            if data_base64 and len(data_base64) > MAX_INLINE_IMAGE_B64_CHARS:
-                raise ValueError(
-                    f"inline image too large ({len(data_base64)} base64 chars, max {MAX_INLINE_IMAGE_B64_CHARS})"
-                )
-            mime = params.get("mime") if isinstance(params.get("mime"), str) else None
             url = params.get("url") if isinstance(params.get("url"), str) else None
-            if not data_base64 and url:
-                # SSRF guard: the URL is agent-(LLM-)controlled, i.e. indirectly
-                # caller-controlled. fetch_public_image validates the host, PINS
-                # the connect-time DNS resolution through the same private-range
-                # check, and follows at most ONE re-validated redirect. Bounded
-                # time and size.
-                img_bytes, mime = await fetch_public_image(url, MAX_IMAGE_BYTES, 10_000)
-                data_base64 = base64.b64encode(img_bytes).decode("ascii")
-            if not data_base64 or not mime or not _IMAGE_MIME_RE.match(mime):
-                raise ValueError("show_image needs {dataBase64, mime} or {url} resolving to image/jpeg or image/png")
+            if not url:
+                raise ValueError("show_image needs a public https image 'url' (jpeg or png)")
+            # SSRF guard: the URL is agent-(LLM-)controlled, i.e. indirectly
+            # caller-controlled. fetch_public_image validates the host, PINS
+            # the connect-time DNS resolution through the same private-range
+            # check, and follows at most ONE re-validated redirect. Bounded
+            # time and size.
+            img_bytes, mime = await fetch_public_image(url, MAX_IMAGE_BYTES, 10_000)
+            if not mime or not _IMAGE_MIME_RE.match(mime):
+                raise ValueError(f'unsupported image type "{mime}" (jpeg/png only)')
+            data_base64 = base64.b64encode(img_bytes).decode("ascii")
             mode = params.get("mode") if isinstance(params.get("mode"), str) else None
             caption = params.get("caption") if isinstance(params.get("caption"), str) else None
             delivered = self._send_to_worker(
@@ -711,7 +735,9 @@ class CallSession:
                 # worker backpressure (undroppable), unlike the normal hot path.
                 for off in range(0, len(pcm), PCM16K_FRAME_BYTES):
                     chunk = pcm[off : off + PCM16K_FRAME_BYTES]
-                    self._emit_audio_to_worker(base64.b64encode(chunk).decode("ascii"), undroppable=True)
+                    self._emit_audio_to_worker(
+                        base64.b64encode(chunk).decode("ascii"), undroppable=True, pcm_bytes=len(chunk)
+                    )
                 played_ms = pcm16k_bytes_to_ms(len(pcm))
                 # Unmute once the goodbye has played out. Normally the call ends
                 # first - but if a peer fails to tear down, the agent must not
@@ -732,7 +758,7 @@ class CallSession:
 
     # ---- plumbing ----
 
-    def _emit_audio_to_worker(self, base64_pcm: str, undroppable: bool = False) -> None:
+    def _emit_audio_to_worker(self, base64_pcm: str, undroppable: bool = False, pcm_bytes: int | None = None) -> None:
         frame = {
             "type": "audio.frame",
             "seq": self._out_seq,
@@ -740,8 +766,12 @@ class CallSession:
             "payloadBase64": base64_pcm,
         }
         self._out_seq += 1
-        # advance the timeline by the actual PCM duration - exact decoded length
-        self._out_timestamp_ms += pcm16k_bytes_to_ms(len(base64.b64decode(base64_pcm)))
+        # Advance the timeline by the actual PCM duration. Callers that just
+        # encoded pass the byte count in - decoding 50x/s/call purely for len()
+        # would be a pointless hot-path round-trip.
+        if pcm_bytes is None:
+            pcm_bytes = len(base64.b64decode(base64_pcm))
+        self._out_timestamp_ms += pcm16k_bytes_to_ms(pcm_bytes)
         metric_inc("bridge_frames_to_worker_total")
         self._send_to_worker(frame, undroppable=undroppable)
 
@@ -777,7 +807,13 @@ class CallSession:
 
     def shutdown(self, reason: str) -> None:
         """Graceful external shutdown (e.g. SIGTERM drain): tell the worker the
-        call is ending, then close both sockets. Idempotent via the closed flag."""
+        call is ending, then close both sockets. A goodbye already in progress
+        is left to finish - its hard-bounded backstop tears the call down - so
+        a redeploy cannot cut off the last thing the caller hears (the server's
+        drain waits for it). Idempotent via the closed flag."""
+        if self._goodbye_in_progress and not self.closed:
+            self.log.info(f"{reason}: goodbye in progress; letting it play out (backstop armed)")
+            return
         self.end_call(reason)
 
     def end_call(self, reason: str) -> None:

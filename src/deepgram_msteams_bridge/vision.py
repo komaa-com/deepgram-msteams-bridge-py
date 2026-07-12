@@ -59,6 +59,10 @@ def make_vision_describer(cfg: BridgeConfig) -> VisionDescriber | None:
             ],
         }
         timeout = aiohttp.ClientTimeout(total=VISION_TIMEOUT_MS / 1000)
+        # Deliberately NOT behind the SSRF guard, unlike show_image: this URL is
+        # operator-configured (VISION_API_URL), not agent/caller-controlled, and
+        # a local Ollama/vLLM endpoint is a documented use case. load_config
+        # still validates the URL and warns when it points at a private range.
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json=body, headers=headers) as res:
                 if res.status != 200:

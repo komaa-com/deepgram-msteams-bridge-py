@@ -29,6 +29,7 @@ from .hmac_auth import (
 )
 from .log import logger
 from .metrics import metric_dec, metric_inc, metric_observe, render_metrics
+from . import session as _session
 from .session import CallSession
 from .vision import VisionDescriber
 
@@ -241,6 +242,11 @@ class BridgeServer:
             seen.add(t.name)
         self._tools = list(tools or [])
         self.sessions: dict[str, CallSession] = {}
+        # callIds reserved SYNCHRONOUSLY at upgrade time, before the first await
+        # (ws.prepare): two concurrent upgrades for the same callId would both
+        # pass the registry check and the second would silently overwrite the
+        # first, leaking a session that holds a billed agent socket forever.
+        self._pending_call_ids: set[str] = set()
         self._open_connections = 0
         self._per_ip: dict[str, int] = {}
         self._replay = ReplayGuard(cfg.hmac_freshness_ms)
@@ -285,11 +291,15 @@ class BridgeServer:
             return web.Response(status=401)
         call_id = auth["callId"]
         # A live session already owns this callId - a retry/rollout reconnect.
-        # Reject rather than spin up a second billed Voice Agent session.
-        if call_id in self.sessions:
+        # Reject rather than spin up a second billed Voice Agent session. The
+        # pending set covers the window between here and registration: it is
+        # claimed before the first await, so a concurrent duplicate cannot slip
+        # past both checks.
+        if call_id in self.sessions or call_id in self._pending_call_ids:
             metric_inc("bridge_upgrades_rejected_duplicate_total")
             log.warn(f"rejected upgrade from {ip}: callId {call_id[:12]}... already has a live session")
             return web.Response(status=409)
+        self._pending_call_ids.add(call_id)
 
         # Claim the connection slots BEFORE any await - a burst of simultaneous
         # upgrades must not transiently exceed the caps. Released exactly once.
@@ -316,6 +326,7 @@ class BridgeServer:
         try:
             await ws.prepare(request)
         except Exception:
+            self._pending_call_ids.discard(call_id)
             release_slots()
             raise
 
@@ -323,35 +334,43 @@ class BridgeServer:
         metric_inc("bridge_calls_total")
         metric_inc("bridge_calls_active")
 
-        port = _AioWorkerPort(ws)
-        session = CallSession(
-            self.cfg,
-            port,
-            call_id,
-            connect_dg=self._connect_dg,
-            vision=self._vision,
-            tools=self._tools,
-            on_closed=lambda: self.sessions.pop(call_id, None),  # evict on teardown
-        )
-        self.sessions[call_id] = session
-
-        # Drop a worker that authenticates but never STARTS a call. The timer asks
-        # the session whether session.start actually arrived - clearing on the
-        # first message of any type would let an authenticated client hold the
-        # socket forever by sending pings.
-        loop = asyncio.get_running_loop()
-
-        def pre_start_check() -> None:
-            if not session.has_started and not session.closed:
-                log.warn(
-                    f"call {call_id[:12]}... sent no session.start in {int(self._pre_start_timeout_s * 1000)}ms; closing"
-                )
-                session.end_call("no session.start")
-
-        pre_start_timer = loop.call_later(self._pre_start_timeout_s, pre_start_check)
-
+        # ONE finally owns every release from here: if any constructor below
+        # raises, the slots, the active gauge, and the pending callId must
+        # still be given back - a leak here climbs to max_connections and then
+        # 503s every new call until restart.
+        port: _AioWorkerPort | None = None
+        session: CallSession | None = None
+        pre_start_timer: asyncio.TimerHandle | None = None
         started = time.monotonic()
         try:
+            port = _AioWorkerPort(ws)
+            session = CallSession(
+                self.cfg,
+                port,
+                call_id,
+                connect_dg=self._connect_dg,
+                vision=self._vision,
+                tools=self._tools,
+                on_closed=lambda: self.sessions.pop(call_id, None),  # evict on teardown
+            )
+            self.sessions[call_id] = session
+            self._pending_call_ids.discard(call_id)  # the registry owns dedup now
+
+            # Drop a worker that authenticates but never STARTS a call. The timer asks
+            # the session whether session.start actually arrived - clearing on the
+            # first message of any type would let an authenticated client hold the
+            # socket forever by sending pings.
+            loop = asyncio.get_running_loop()
+
+            def pre_start_check() -> None:
+                if session is not None and not session.has_started and not session.closed:
+                    log.warn(
+                        f"call {call_id[:12]}... sent no session.start in {int(self._pre_start_timeout_s * 1000)}ms; closing"
+                    )
+                    session.end_call("no session.start")
+
+            pre_start_timer = loop.call_later(self._pre_start_timeout_s, pre_start_check)
+
             async for frame in ws:
                 if frame.type == WSMsgType.TEXT:
                     session.handle_worker_message(frame.data)
@@ -361,9 +380,13 @@ class BridgeServer:
                     session.handle_worker_error(ws.exception() or RuntimeError("websocket error"))
                     break
         finally:
-            pre_start_timer.cancel()
-            session.handle_worker_close()
-            port.stop_writer()
+            self._pending_call_ids.discard(call_id)
+            if pre_start_timer is not None:
+                pre_start_timer.cancel()
+            if session is not None:
+                session.handle_worker_close()
+            if port is not None:
+                port.stop_writer()
             metric_dec("bridge_calls_active")
             elapsed = time.monotonic() - started
             # cumulative counter (averages) + histogram (p50/p95/p99)
@@ -386,6 +409,7 @@ class BridgeServer:
         ssl_ctx: ssl.SSLContext | None = None
         if self.cfg.tls_cert_path and self.cfg.tls_key_path:
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # never negotiate down to 1.0/1.1
             ssl_ctx.load_cert_chain(self.cfg.tls_cert_path, self.cfg.tls_key_path)
             log.info("native TLS enabled (wss)")
         else:
@@ -401,7 +425,10 @@ class BridgeServer:
 
     async def drain(self, signal_name: str = "shutdown") -> None:
         """Gracefully end every live call (session.end + close both sockets)
-        instead of hard-dropping calls on a redeploy."""
+        instead of hard-dropping calls on a redeploy. A session mid-goodbye is
+        left to finish (session.shutdown defers to its hard-bounded backstop),
+        so the wait is bounded by the worst-case goodbye deadline - a fixed 2 s
+        would truncate a goodbye the caller is still hearing."""
         sessions = list(self.sessions.values())
         log.info(f"{signal_name}: draining {len(sessions)} live call(s)")
         for s in sessions:
@@ -409,10 +436,17 @@ class BridgeServer:
                 s.shutdown("bridge-shutdown")
             except Exception:
                 pass  # keep draining the rest
-        if sessions:
-            # teardown queues session.end + starts the close handshakes
-            # asynchronously; exiting immediately would cut those before they flush.
-            await asyncio.sleep(SHUTDOWN_GRACE_S)
+        if not sessions:
+            return
+        deadline = time.monotonic() + max(
+            SHUTDOWN_GRACE_S,
+            (self.cfg.goodbye_grace_ms + _session.GOODBYE_HARD_CAP_MS) / 1000 + 0.5,
+        )
+        while self.sessions and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        # teardown queues session.end + starts the close handshakes
+        # asynchronously; exiting immediately would cut those before they flush.
+        await asyncio.sleep(SHUTDOWN_GRACE_S)
 
     async def close(self) -> None:
         await self.drain()

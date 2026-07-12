@@ -9,13 +9,26 @@ from datetime import datetime, timezone
 
 _ORDER = {"debug": 10, "info": 20, "warn": 30, "error": 40}
 
+# Cached minimum level: _emit runs on the audio hot path (debug calls at
+# 50 frames/s/call), so the env is read once, not per line. Anything that
+# mutates LOG_LEVEL after import (the CLI's .env loader) calls refresh_log_level().
+_cached_level: str | None = None
+
+
+def refresh_log_level() -> None:
+    """Re-read LOG_LEVEL on the next emit (call after mutating the environment)."""
+    global _cached_level
+    _cached_level = None
+
 
 def _min_level() -> str:
-    """Read LOG_LEVEL per emit (cheap) so .env loading and runtime changes take
-    effect. Falls back to "info" for an unset OR invalid value - without the
+    """Falls back to "info" for an unset OR invalid value - without the
     membership check, a typo (e.g. LOG_LEVEL=verbose) would emit every level."""
-    requested = os.environ.get("LOG_LEVEL", "").strip().lower()
-    return requested if requested in _ORDER else "info"
+    global _cached_level
+    if _cached_level is None:
+        requested = os.environ.get("LOG_LEVEL", "").strip().lower()
+        _cached_level = requested if requested in _ORDER else "info"
+    return _cached_level
 
 
 def _emit(level: str, scope: str, msg: str, extra: object = None) -> None:

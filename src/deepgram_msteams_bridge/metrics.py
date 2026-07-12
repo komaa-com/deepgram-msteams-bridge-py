@@ -17,6 +17,8 @@ _META: dict[str, tuple[str, str]] = {
     "bridge_frames_to_worker_total": ("Agent audio frames relayed to the worker", "counter"),
     "bridge_frames_dropped_total": ("Frames dropped under worker backpressure", "counter"),
     "bridge_agent_connect_failures_total": ("Deepgram Voice Agent connect failures", "counter"),
+    "bridge_agent_errors_total": ("Error events from the Deepgram Voice Agent", "counter"),
+    "bridge_injections_refused_total": ("InjectAgentMessage attempts Deepgram refused", "counter"),
 }
 
 _counts: dict[str, float] = {}

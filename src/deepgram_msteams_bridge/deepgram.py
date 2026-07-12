@@ -42,6 +42,10 @@ DG_REST_TIMEOUT_MS = 10_000
 # How long to wait for the server's Welcome after the socket opens.
 WELCOME_TIMEOUT_S = 10.0
 
+# ws:// exists only so tests can dial a loopback fake agent; production
+# connects are always wss (the config layer pins hosts to *.deepgram.com).
+_WS_SCHEME = "wss"
+
 # Outbound (bridge->DG) send-buffer cap, mirroring the worker-side guard: a
 # stalled agent socket must not pile up unbounded caller-audio send tasks.
 MAX_DG_SEND_BUFFER_BYTES = 1 * 1024 * 1024
@@ -208,6 +212,9 @@ def build_settings(
     return {
         "type": "Settings",
         "audio": {
+            # input takes only encoding + sample_rate; "container" is an
+            # OUTPUT-side field in the Voice Agent Settings schema (every
+            # official Settings example omits it on input).
             "input": {"encoding": "linear16", "sample_rate": WIRE_SAMPLE_RATE},
             "output": {"encoding": "linear16", "sample_rate": WIRE_SAMPLE_RATE, "container": "none"},
         },
@@ -276,7 +283,9 @@ class AgentPort(Protocol):
     def send_settings(self, settings: dict[str, Any]) -> None: ...
     def update_prompt(self, prompt: str) -> None: ...
     def inject_agent_message(self, text: str) -> None: ...
-    def send_function_call_response(self, call_id: str, name: str, content: str) -> None: ...
+    # May return an awaitable for the delivery (the real socket does); the
+    # session awaits it, when present, before closing on end_call.
+    def send_function_call_response(self, call_id: str, name: str, content: str) -> Any: ...
     def close(self) -> None: ...
 
 
@@ -324,7 +333,7 @@ class DeepgramAgentSocket:
         return sock
 
     async def _open_once(self) -> None:
-        url = f"wss://{self._cfg.agent_host}/v1/agent/converse"
+        url = f"{_WS_SCHEME}://{self._cfg.agent_host}/v1/agent/converse"
         # Bound the WS open: a blackholed TCP connect or a stalled TLS/upgrade
         # handshake must not hang session.start forever (the governor is only
         # armed after connect).
@@ -353,6 +362,14 @@ class DeepgramAgentSocket:
                     continue
                 if isinstance(msg, dict) and msg.get("type") == "Welcome":
                     return
+                # A JSON Error before Welcome (bad API key, bad config) must
+                # fail NOW with the real reason, not be swallowed until the
+                # Welcome timeout raises a generic message 10 s later.
+                if isinstance(msg, dict) and msg.get("type") == "Error":
+                    raise RuntimeError(
+                        f"Deepgram rejected the session before Welcome: "
+                        f"{msg.get('code') or 'unknown'}: {msg.get('description') or 'no description'}"
+                    )
             elif frame.type == aiohttp.WSMsgType.BINARY:
                 continue  # audio cannot arrive before Settings; ignore defensively
             elif frame.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
@@ -433,21 +450,25 @@ class DeepgramAgentSocket:
     def is_open(self) -> bool:
         return self._ws is not None and not self._ws.closed
 
-    def _send(self, obj: dict[str, Any]) -> None:
+    def _send(self, obj: dict[str, Any]) -> "asyncio.Future[None] | None":
+        """Fire-and-forget JSON send; returns the send task so a caller that
+        must not race the socket close (end_call's tool reply) can await it."""
         ws = self._ws
         if ws is None or ws.closed:
-            return
+            return None
         payload = json.dumps(obj)
-        self._pending_send_bytes += len(payload)
-        asyncio.ensure_future(self._send_str_safe(ws, payload))
+        # encoded byte length, so the counter shares units with the binary path
+        nbytes = len(payload.encode("utf-8"))
+        self._pending_send_bytes += nbytes
+        return asyncio.ensure_future(self._send_str_safe(ws, payload, nbytes))
 
-    async def _send_str_safe(self, ws: aiohttp.ClientWebSocketResponse, payload: str) -> None:
+    async def _send_str_safe(self, ws: aiohttp.ClientWebSocketResponse, payload: str, nbytes: int) -> None:
         try:
             await ws.send_str(payload)
         except Exception:
             pass  # socket died mid-send; the read loop reports the close
         finally:
-            self._pending_send_bytes -= len(payload)
+            self._pending_send_bytes -= nbytes
 
     def send_audio_chunk(self, base64_pcm: str) -> None:
         """Caller audio -> agent, as a raw binary frame (base64 wire payload
@@ -495,9 +516,10 @@ class DeepgramAgentSocket:
         refused (InjectionRefused) while the agent is mid-utterance."""
         self._send({"type": "InjectAgentMessage", "message": text})
 
-    def send_function_call_response(self, call_id: str, name: str, content: str) -> None:
-        """Answer a client-side FunctionCallRequest."""
-        self._send({"type": "FunctionCallResponse", "id": call_id, "name": name, "content": content})
+    def send_function_call_response(self, call_id: str, name: str, content: str) -> "asyncio.Future[None] | None":
+        """Answer a client-side FunctionCallRequest. Returns the send task
+        (awaitable) so end_call can flush the reply before closing."""
+        return self._send({"type": "FunctionCallResponse", "id": call_id, "name": name, "content": content})
 
     def close(self) -> None:
         if self._keepalive_task is not None and not self._keepalive_task.done():
