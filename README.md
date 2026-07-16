@@ -15,7 +15,7 @@ LLM + Aura TTS, with turn-taking, all run by Deepgram).
 
 This is the Python sibling of [`@komaa/deepgram-msteams-bridge`](https://www.npmjs.com/package/@komaa/deepgram-msteams-bridge)
 (Node.js) - same wire contract, same environment variables, drop-in interchangeable behind the same
-`.env` file. It terminates the StandIn media bridge wire protocol on one side and the Deepgram
+`.env` file. The Node and Python packages version independently, so a version-number gap between them is expected; both implement the same StandIn wire protocol and interoperate with the hosted service identically. It terminates the StandIn media bridge wire protocol on one side and the Deepgram
 Voice Agent WebSocket (`wss://agent.deepgram.com/v1/agent/converse`) on the other:
 
 - **No transcoding**: the StandIn wire is base64 PCM 16 kHz mono and the Voice Agent session is
