@@ -5,7 +5,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/deepgram-msteams-bridge.svg)](https://pypi.org/project/deepgram-msteams-bridge/)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/komaa-com/deepgram-msteams-bridge-py)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/komaa-com/deepgram-msteams-bridge-py/blob/main/CONTRIBUTING.md)
 
 Bridge **Microsoft Teams voice/video calls** to a **Deepgram Voice Agent** (Nova STT + your chosen
 LLM + Aura TTS, with turn-taking, all run by Deepgram).
