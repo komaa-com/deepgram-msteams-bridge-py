@@ -39,3 +39,10 @@ def test_is_fresh_window():
     assert not is_fresh(now - 60_001, 60_000, now)
     assert not is_fresh(float("nan"), 60_000, now)
     assert not is_fresh(float("inf"), 60_000, now)
+
+
+def test_verify_never_raises_on_non_ascii_input() -> None:
+    # compare_digest raises TypeError on non-ASCII str - an attacker-supplied
+    # header must produce a clean False (-> 401), never an exception (-> 500).
+    assert verify("secret", 1234, "call-1", "sign\u00e4ture") is False
+    assert verify("secret", 1234, "call-\u00fc", "0" * 64) is False

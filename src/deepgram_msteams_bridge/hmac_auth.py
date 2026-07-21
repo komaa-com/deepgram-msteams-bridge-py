@@ -26,11 +26,16 @@ def sign(secret: str, timestamp_ms: int | str, call_id: str) -> str:
 
 
 def verify(secret: str, timestamp_ms: int | str, call_id: str, signature: str) -> bool:
-    """Constant-time verification; False on any missing input rather than raising."""
+    """Constant-time verification; False on any missing OR malformed input
+    rather than raising - compare_digest raises TypeError on non-ASCII str
+    input, and an attacker-supplied header must never turn a 401 into a 500."""
     if not secret or not call_id or not signature:
         return False
-    expected = sign(secret, timestamp_ms, call_id)
-    return _hmac.compare_digest(expected, signature.lower())
+    try:
+        expected = sign(secret, timestamp_ms, call_id)
+        return _hmac.compare_digest(expected, signature.lower())
+    except (TypeError, ValueError):
+        return False
 
 
 def is_fresh(timestamp_ms: float, window_ms: float, now_ms: float | None = None) -> bool:
